@@ -122,9 +122,48 @@ pub struct TLSInnerPlaintext {
 }
 impl ByteSerializable for TLSInnerPlaintext {
     fn as_bytes(&self) -> Option<Vec<u8>> {
-        todo!("Implement TLSInnerPlaintext as_bytes")
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&self.content);
+        bytes.push(self.content_type as u8);
+        bytes.extend_from_slice(&self.zeros);
+        Some(bytes)
     }
-    fn from_bytes(_bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
-        todo!("Implement TLSInnerPlaintext from_bytes")
+    fn from_bytes(bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
+        let all = bytes.drain();
+        if all.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLSInnerPlaintext length too short",
+            ));
+        }
+
+        let type_pos = all.iter().rposition(|&b| b != 0).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "TLSInnerPlaintext content type not found",
+            )
+        })?;
+
+        let content_type = match all[type_pos] {
+            20 => ContentType::ChangeCipherSpec,
+            21 => ContentType::Alert,
+            22 => ContentType::Handshake,
+            23 => ContentType::ApplicationData,
+            _ => {
+                return Err(io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Invalid TLSInnerPlaintext content type: {}", all[type_pos]),
+                ))
+            }
+        };
+
+        let content = all[..type_pos].to_vec();
+        let zeros = all[type_pos + 1..].to_vec();
+
+        Ok(Box::from(TLSInnerPlaintext {
+            content,
+            content_type,
+            zeros,
+        }))
     }
 }
