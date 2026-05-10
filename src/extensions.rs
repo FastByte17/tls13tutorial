@@ -242,7 +242,7 @@ impl ByteSerializable for SupportedVersions {
         } else {
             let version = bytes.get_u16().ok_or_else(ByteParser::insufficient_data)?;
             Ok(Box::new(SupportedVersions {
-                version: VersionKind::Suggested(vec![version]),
+                version: VersionKind::Selected(version),
             }))
         }
     }

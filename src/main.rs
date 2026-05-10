@@ -184,21 +184,23 @@ impl HandshakeKeys {
 /// Process the data from TCP stream in the chunks of 4096 bytes and
 /// read the response data into a buffer in a form of Queue for easier parsing.
 fn process_tcp_stream(mut stream: &mut TcpStream) -> io::Result<VecDeque<u8>> {
-    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+    stream.set_read_timeout(Some(Duration::from_millis(2000)))?;
     let mut reader = io::BufReader::new(&mut stream);
     let mut buffer: VecDeque<u8> = VecDeque::new();
     let mut chunk = [0; 4096];
     loop {
         match reader.read(&mut chunk) {
-            Ok(0) => break, // End of data
+            Ok(0) => break,
             Ok(n) => {
                 debug!("Received {n} bytes of data.");
                 buffer.extend(&chunk[..n]);
             }
-            // Nothing to read and no null termination
-            // We don't wait more than 0.5 seconds
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                warn!("TCP read blocking for more than 0.5 seconds...force return.");
+                warn!("TCP read blocking...force return.");
+                return Ok(buffer);
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::TimedOut => {
+                warn!("TCP read timed out...force return.");
                 return Ok(buffer);
             }
             Err(e) => {
@@ -274,7 +276,14 @@ fn main() {
                         extension_type: ExtensionType::SignatureAlgorithms,
                         extension_data: ExtensionData::SignatureAlgorithms(
                             SupportedSignatureAlgorithms {
-                                supported_signature_algorithms: vec![SignatureScheme::Ed25519],
+                                supported_signature_algorithms: vec![
+                                    SignatureScheme::Ed25519,
+                                    SignatureScheme::RsaPssRsaeSha256,
+                                    SignatureScheme::RsaPssRsaeSha384,
+                                    SignatureScheme::RsaPssRsaeSha512,
+                                    SignatureScheme::EcdsaSecp256r1Sha256,
+                                    SignatureScheme::EcdsaSecp384r1Sha384,
+                                ],
                             },
                         ),
                     },
@@ -351,12 +360,11 @@ fn main() {
                     },
                     ContentType::Handshake => {
                         debug!("Raw handshake data: {:?}", record.fragment);
+                        let raw_server_hello_bytes = record.fragment.clone();
                         let handshake = *Handshake::from_bytes(&mut record.fragment.into())
                             .expect("Failed to parse Handshake message");
                         debug!("Handshake message: {:?}", &handshake);
-                        let server_hello_handshake_bytes = handshake
-                            .as_bytes()
-                            .expect("Failed to serialize ServerHello");
+
                         if let HandshakeMessage::ServerHello(server_hello) = handshake.message {
                             info!("ServerHello message: {:?}", server_hello);
 
@@ -381,11 +389,11 @@ fn main() {
 
                             let mut transcript = Sha256::new();
                             transcript.update(&client_handshake_bytes);
-                            transcript.update(&server_hello_handshake_bytes);
+                            transcript.update(&raw_server_hello_bytes);
                             let transcript_hash = transcript.finalize();
 
                             handshake_keys.key_schedule(&transcript_hash);
-                            info!("Handshake keys derived successfully")
+                            info!("Handshake keys derived successfully");
                         }
                     }
                     ContentType::ApplicationData => {
@@ -416,7 +424,6 @@ fn main() {
                             },
                         ) {
                             Ok(inner_bytes) => {
-                                // TLSInnerPlaintext: content || ContentType || zero padding
                                 let content_type_idx = inner_bytes
                                     .iter()
                                     .rposition(|&b| b != 0)
@@ -426,15 +433,33 @@ fn main() {
 
                                 info!("Decrypted record, inner type: {:?}", content_type);
 
-                                let mut content_parser = ByteParser::from(content);
-                                match tls13tutorial::handshake::Handshake::from_bytes(
-                                    &mut content_parser,
-                                ) {
-                                    Ok(hs) => {
-                                        info!("Inner handshake: {:?}", hs.msg_type);
+                                match content_type {
+                                    22 => {
+                                        let mut content_parser = ByteParser::from(content);
+                                        while !content_parser.is_empty() {
+                                            let remaining_before = content_parser.len();
+                                            match tls13tutorial::handshake::Handshake::from_bytes(
+                                                &mut content_parser,
+                                            ) {
+                                                Ok(hs) => {
+                                                    info!("Inner handshake: {:?}, consumed {} bytes, {} remaining",
+                    hs.msg_type,
+                    remaining_before - content_parser.len(),
+                    content_parser.len()
+                );
+                                                }
+                                                Err(e) => {
+                                                    error!("Could not parse inner handshake: {e}, {} bytes remaining", content_parser.len());
+                                                    break;
+                                                }
+                                            }
+                                        }
                                     }
-                                    Err(e) => {
-                                        error!("Could not parse inner handshake: {e}");
+                                    21 => {
+                                        info!("Encrypted alert received: {:?}", content);
+                                    }
+                                    _ => {
+                                        warn!("Unknown inner content type: {}", content_type);
                                     }
                                 }
                             }
@@ -445,6 +470,9 @@ fn main() {
                                 );
                             }
                         }
+                    }
+                    ContentType::ChangeCipherSpec => {
+                        debug!("ChangeCipherSpec received, ignoring (TLS 1.3 compatibility)");
                     }
                     _ => {
                         error!("Unexpected response type: {:?}", record.record_type);

@@ -119,6 +119,8 @@ impl ByteSerializable for Handshake {
         let hs_type = match bytes.get_u8() {
             Some(1) => HandshakeType::ClientHello,
             Some(2) => HandshakeType::ServerHello,
+            Some(4) => HandshakeType::NewSessionTicket,
+            Some(8) => HandshakeType::EncryptedExtensions,
             Some(11) => HandshakeType::Certificate,
             Some(15) => HandshakeType::CertificateVerify,
             Some(20) => HandshakeType::Finished,
@@ -135,23 +137,30 @@ impl ByteSerializable for Handshake {
                 "Invalid handshake message length",
             )
         })?;
+
+        let msg_bytes = bytes.get_bytes(msg_length as usize);
+        let mut msg_parser = ByteParser::from(msg_bytes.as_slice());
+
         let hs_message = match hs_type {
             HandshakeType::ClientHello => {
-                let client_hello = ClientHello::from_bytes(bytes)?;
+                let client_hello = ClientHello::from_bytes(&mut msg_parser)?;
                 HandshakeMessage::ClientHello(*client_hello)
             }
             HandshakeType::ServerHello => {
-                let server_hello = ServerHello::from_bytes(bytes)?;
+                let server_hello = ServerHello::from_bytes(&mut msg_parser)?;
                 HandshakeMessage::ServerHello(*server_hello)
             }
             HandshakeType::Certificate => {
-                let certificate = Certificate::from_bytes(bytes)?;
+                let certificate = Certificate::from_bytes(&mut msg_parser)?;
                 HandshakeMessage::Certificate(*certificate)
             }
             HandshakeType::Finished => {
-                let finished = Finished::from_bytes(bytes)?;
+                let finished = Finished::from_bytes(&mut msg_parser)?;
                 HandshakeMessage::Finished(*finished)
             }
+            HandshakeType::EncryptedExtensions => HandshakeMessage::EncryptedExtensions,
+            HandshakeType::CertificateVerify => HandshakeMessage::CertificateVerify,
+            HandshakeType::NewSessionTicket => HandshakeMessage::NewSessionTicket,
             _ => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -174,20 +183,16 @@ pub struct Finished {
 }
 impl ByteSerializable for Finished {
     fn as_bytes(&self) -> Option<Vec<u8>> {
-        let mut bytes = Vec::new();
-        #[allow(clippy::cast_possible_truncation)]
-        bytes.push(self.verify_data.len() as u8);
-        bytes.extend_from_slice(self.verify_data.as_slice());
-        Some(bytes)
+        Some(self.verify_data.clone())
     }
     fn from_bytes(bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
-        let length = bytes.get_u8().ok_or_else(|| {
-            std::io::Error::new(
+        if bytes.is_empty() {
+            return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Invalid Finished message length",
-            )
-        })?;
-        let verify_data = bytes.get_bytes(length as usize);
+                "Finished: no data",
+            ));
+        }
+        let verify_data = bytes.drain();
         Ok(Box::new(Finished { verify_data }))
     }
 }
