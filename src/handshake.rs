@@ -384,9 +384,65 @@ pub struct Certificate {
 
 impl ByteSerializable for Certificate {
     fn as_bytes(&self) -> Option<Vec<u8>> {
-        todo!("Implement Certificate::as_bytes")
+        let mut bytes = Vec::new();
+        bytes.push(u8::try_from(self.certificate_request_context.len()).ok()?);
+        bytes.extend_from_slice(&self.certificate_request_context);
+
+        let mut list_bytes = Vec::new();
+        for entry in &self.certificate_list {
+            let cert_len = u32::try_from(entry.certificate_data.len()).ok()?;
+            list_bytes.extend_from_slice(&cert_len.to_be_bytes()[1..]);
+            list_bytes.extend_from_slice(&entry.certificate_data);
+
+            let mut ext_bytes = Vec::new();
+            for ext in &entry.extensions {
+                ext_bytes.extend(ext.as_bytes()?);
+            }
+            let ext_len = u16::try_from(ext_bytes.len()).ok()?;
+            list_bytes.extend_from_slice(&ext_len.to_be_bytes());
+            list_bytes.extend(ext_bytes);
+        }
+
+        let list_len = u32::try_from(list_bytes.len()).ok()?;
+        bytes.extend_from_slice(&list_len.to_be_bytes()[1..]);
+        bytes.extend(list_bytes);
+        Some(bytes)
     }
-    fn from_bytes(_bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
-        todo!("Implement Certificate::from_bytes")
+    fn from_bytes(bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
+        let ctx_len = bytes.get_u8().ok_or_else(ByteParser::insufficient_data)? as usize;
+        let certificate_request_context = bytes.get_bytes(ctx_len);
+
+        let list_len = bytes.get_u24().ok_or_else(ByteParser::insufficient_data)? as usize;
+        let list_data = bytes.get_bytes(list_len);
+        let mut list_parser = ByteParser::from(list_data.as_slice());
+
+        let mut certificate_list = Vec::new();
+        while !list_parser.deque.is_empty() {
+            let cert_len = list_parser
+                .get_u24()
+                .ok_or_else(ByteParser::insufficient_data)? as usize;
+            let certificate_data = list_parser.get_bytes(cert_len);
+
+            let ext_len = list_parser
+                .get_u16()
+                .ok_or_else(ByteParser::insufficient_data)? as usize;
+            let ext_data = list_parser.get_bytes(ext_len);
+            let mut ext_parser = ByteParser::from(ext_data.as_slice());
+
+            let mut extensions = Vec::new();
+            while !ext_parser.is_empty() {
+                let ext = Extension::from_bytes(&mut ext_parser, ExtensionOrigin::Server)?;
+                extensions.push(*ext);
+            }
+            certificate_list.push(CertificateEntry {
+                certificate_type: CertificateType::X509,
+                certificate_data,
+                extensions,
+            });
+        }
+        Ok(Box::new(Certificate {
+            certificate_request_context,
+            certificate_list,
+        }))
     }
 }
