@@ -1,6 +1,6 @@
 #![allow(dead_code)]
+use hmac::{Hmac, Mac};
 use log::{debug, error, info, warn};
-#[cfg(not(debug_assertions))]
 use rand::rngs::OsRng;
 use std::collections::VecDeque;
 use std::io::{self, Read as SocketRead, Write as SocketWrite};
@@ -348,6 +348,7 @@ fn main() {
                 error!("Failed to process the records: {e}");
                 std::process::exit(1)
             });
+            let mut raw_server_hello_bytes: Vec<u8> = Vec::new();
             for record in response_records {
                 match record.record_type {
                     ContentType::Alert => match Alert::from_bytes(&mut record.fragment.into()) {
@@ -360,7 +361,7 @@ fn main() {
                     },
                     ContentType::Handshake => {
                         debug!("Raw handshake data: {:?}", record.fragment);
-                        let raw_server_hello_bytes = record.fragment.clone();
+                        raw_server_hello_bytes = record.fragment.clone();
                         let handshake = *Handshake::from_bytes(&mut record.fragment.into())
                             .expect("Failed to parse Handshake message");
                         debug!("Handshake message: {:?}", &handshake);
@@ -454,6 +455,70 @@ fn main() {
                                                 }
                                             }
                                         }
+                                        let mut finished_transcript = Sha256::new();
+                                        finished_transcript.update(&client_handshake_bytes);
+                                        finished_transcript.update(&raw_server_hello_bytes);
+                                        finished_transcript.update(content);
+                                        let finished_hash = finished_transcript.finalize();
+
+                                        let finished_key = &handshake_keys.client_hs_finished_key;
+                                        let mut mac =
+                                            <Hmac<Sha256> as Mac>::new_from_slice(finished_key)
+                                                .unwrap();
+                                        mac.update(&finished_hash);
+                                        let verify_data = mac.finalize().into_bytes().to_vec();
+
+                                        let finished_msg =
+                                            tls13tutorial::handshake::Finished { verify_data };
+                                        let finished_hs = Handshake {
+                                            msg_type: HandshakeType::Finished,
+                                            length: finished_msg.verify_data.len() as u32,
+                                            message: HandshakeMessage::Finished(finished_msg),
+                                        };
+                                        let finished_bytes = finished_hs.as_bytes().unwrap();
+
+                                        let mut plaintext = finished_bytes.clone();
+                                        plaintext.push(0x16);
+
+                                        let mut nonce_bytes = [0u8; 12];
+                                        nonce_bytes.copy_from_slice(&handshake_keys.client_hs_iv);
+                                        let seq_bytes = handshake_keys.client_seq_num.to_be_bytes();
+                                        for i in 0..8 {
+                                            nonce_bytes[4 + i] ^= seq_bytes[i];
+                                        }
+                                        handshake_keys.client_seq_num += 1;
+
+                                        let ct_len = (plaintext.len() + 16) as u16;
+                                        let aad = vec![
+                                            0x17u8,
+                                            0x03,
+                                            0x03,
+                                            (ct_len >> 8) as u8,
+                                            ct_len as u8,
+                                        ];
+                                        let key = Key::from_slice(&handshake_keys.client_hs_key);
+                                        let cipher = ChaCha20Poly1305::new(key);
+                                        let nonce = Nonce::from_slice(&nonce_bytes);
+                                        let ciphertext = cipher
+                                            .encrypt(
+                                                nonce,
+                                                Payload {
+                                                    msg: &plaintext,
+                                                    aad: &aad,
+                                                },
+                                            )
+                                            .unwrap();
+
+                                        let finished_record = TLSRecord {
+                                            record_type: ContentType::ApplicationData,
+                                            legacy_record_version: TLS_VERSION_COMPATIBILITY,
+                                            length: ciphertext.len() as u16,
+                                            fragment: ciphertext,
+                                        };
+                                        stream
+                                            .write_all(&finished_record.as_bytes().unwrap())
+                                            .unwrap();
+                                        info!("ClientFinished sent!");
                                     }
                                     21 => {
                                         info!("Encrypted alert received: {:?}", content);
