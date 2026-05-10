@@ -20,12 +20,13 @@ use tls13tutorial::handshake::{
 use tls13tutorial::tls_record::{ContentType, TLSRecord};
 
 // Cryptographic libraries
-// use chacha20poly1305::{
-//     aead::{Aead, KeyInit, Payload},
-//     ChaCha20Poly1305,
-// };
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, Payload},
+    ChaCha20Poly1305, Key, Nonce,
+};
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
+use tls13tutorial::parser::ByteParser;
 use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 
 const DEBUGGING_EPHEMERAL_SECRET: [u8; 32] = [
@@ -229,7 +230,7 @@ fn main() {
         std::process::exit(1);
     };
     // Create initial random values and keys for the handshake
-    let handshake_keys = HandshakeKeys::new();
+    let mut handshake_keys = HandshakeKeys::new();
 
     match TcpStream::connect(address) {
         Ok(mut stream) => {
@@ -353,22 +354,97 @@ fn main() {
                         let handshake = *Handshake::from_bytes(&mut record.fragment.into())
                             .expect("Failed to parse Handshake message");
                         debug!("Handshake message: {:?}", &handshake);
+                        let server_hello_handshake_bytes = handshake
+                            .as_bytes()
+                            .expect("Failed to serialize ServerHello");
                         if let HandshakeMessage::ServerHello(server_hello) = handshake.message {
                             info!("ServerHello message: {:?}", server_hello);
-                            warn!("TODO: Implement the server hello message processing, and decoding of the rest of the extensions");
-                            // TODO find the key share entry for X25519
-                            // Calculate the shared secret (Check X25519_dalek crate)
-                            // Store the shared secret in the HandshakeKeys struct, and calculate the key schedule
-                            // TODO calculate transcript hash for hello messages (check illustration site and standard)
+
+                            let server_pub_key_bytes = server_hello
+                                .extensions
+                                .iter()
+                                .find_map(|ext| {
+                                    if let ExtensionData::KeyShareServerHello(ref ks) =
+                                        ext.extension_data
+                                    {
+                                        Some(ks.server_share.key_exchange.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .expect("No KeyShare extension found in ServerHello");
+
+                            let server_pub_array: [u8; 32] = server_pub_key_bytes
+                                .try_into()
+                                .expect("Server public key must be 32 bytes long");
+                            handshake_keys.dh_server_public = PublicKey::from(server_pub_array);
+
+                            let mut transcript = Sha256::new();
+                            transcript.update(&client_handshake_bytes);
+                            transcript.update(&server_hello_handshake_bytes);
+                            let transcript_hash = transcript.finalize();
+
+                            handshake_keys.key_schedule(&transcript_hash);
+                            info!("Handshake keys derived successfully")
                         }
                     }
                     ContentType::ApplicationData => {
-                        // Application data received
-                        // Decrypt the data using the keys
-                        // Read TLSInnerPlaintext and proceed with the handshake
                         info!("Application data received, size of : {:?}", record.length);
-                        assert_eq!(record.fragment.len(), record.length as usize);
-                        warn!("TODO: Decryption of the data and decoding of the all extensions not implemented");
+
+                        let mut nonce_bytes = [0u8; 12];
+                        nonce_bytes.copy_from_slice(&handshake_keys.server_hs_iv);
+                        let seq_bytes = handshake_keys.server_seq_num.to_be_bytes();
+                        for i in 0..8 {
+                            nonce_bytes[4 + i] ^= seq_bytes[i];
+                        }
+                        handshake_keys.server_seq_num += 1;
+
+                        let aad = {
+                            let len = record.length.to_be_bytes();
+                            vec![0x17u8, 0x03, 0x03, len[0], len[1]]
+                        };
+
+                        let key = Key::from_slice(&handshake_keys.server_hs_key);
+                        let cipher = ChaCha20Poly1305::new(key);
+                        let nonce = Nonce::from_slice(&nonce_bytes);
+
+                        match cipher.decrypt(
+                            nonce,
+                            Payload {
+                                msg: &record.fragment,
+                                aad: &aad,
+                            },
+                        ) {
+                            Ok(inner_bytes) => {
+                                // TLSInnerPlaintext: content || ContentType || zero padding
+                                let content_type_idx = inner_bytes
+                                    .iter()
+                                    .rposition(|&b| b != 0)
+                                    .expect("Decrypted TLSInnerPlaintext has no content type");
+                                let content_type = inner_bytes[content_type_idx];
+                                let content = &inner_bytes[..content_type_idx];
+
+                                info!("Decrypted record, inner type: {:?}", content_type);
+
+                                let mut content_parser = ByteParser::from(content);
+                                match tls13tutorial::handshake::Handshake::from_bytes(
+                                    &mut content_parser,
+                                ) {
+                                    Ok(hs) => {
+                                        info!("Inner handshake: {:?}", hs.msg_type);
+                                    }
+                                    Err(e) => {
+                                        error!("Could not parse inner handshake: {e}");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Decryption failed (seq: {}): {e}",
+                                    handshake_keys.server_seq_num - 1
+                                );
+                            }
+                        }
                     }
                     _ => {
                         error!("Unexpected response type: {:?}", record.record_type);
