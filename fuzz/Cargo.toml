@@ -19,3 +19,31 @@ path = "fuzz_targets/fuzz_target_1.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_key_share"
+path = "fuzz_targets/fuzz_key_share.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_server_hello"
+path = "fuzz_targets/fuzz_server_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_certificate"
+path = "fuzz_targets/fuzz_cert.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_handshake"
+path = "fuzz_targets/fuzz_hs.rs"
+test = false
+doc = false
+bench = false
