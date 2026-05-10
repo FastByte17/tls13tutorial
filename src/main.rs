@@ -519,6 +519,201 @@ fn main() {
                                             .write_all(&finished_record.as_bytes().unwrap())
                                             .unwrap();
                                         info!("ClientFinished sent!");
+                                        // Derive application traffic keys
+                                        // Read the server's response to ClientFinished
+                                        let post_hs_buffer =
+                                            process_tcp_stream(&mut stream).unwrap_or_default();
+                                        info!(
+                                            "Post-handshake data received: {} bytes",
+                                            post_hs_buffer.len()
+                                        );
+
+                                        // Derive application traffic keys
+                                        // These follow from the handshake secret via another round of the key schedule
+                                        let sha256_empty = Sha256::digest([]);
+                                        let (early_secret, _) = hkdf::Hkdf::<Sha256>::extract(
+                                            Some(&[0u8; 32]),
+                                            &[0u8; 32],
+                                        );
+                                        let derived_secret_hs = HandshakeKeys::derive_secret(
+                                            &{
+                                                // Re-derive handshake secret — need it for master secret derivation
+                                                // Easier: store it in HandshakeKeys. For now recompute from stored shared secret
+                                                let sha256_empty2 = Sha256::digest([]);
+                                                let (es, _) = hkdf::Hkdf::<Sha256>::extract(
+                                                    Some(&[0u8; 32]),
+                                                    &[0u8; 32],
+                                                );
+                                                let ds = HandshakeKeys::derive_secret(
+                                                    &es,
+                                                    b"derived",
+                                                    &sha256_empty2,
+                                                    32,
+                                                );
+                                                let (hs, _) = hkdf::Hkdf::<Sha256>::extract(
+                                                    Some(&ds),
+                                                    handshake_keys
+                                                        .dh_shared_secret
+                                                        .as_ref()
+                                                        .unwrap()
+                                                        .as_bytes(),
+                                                );
+                                                hs
+                                            },
+                                            b"derived",
+                                            &sha256_empty,
+                                            32,
+                                        );
+                                        let (master_secret, _) = hkdf::Hkdf::<Sha256>::extract(
+                                            Some(&derived_secret_hs),
+                                            &[0u8; 32],
+                                        );
+
+                                        // Full transcript hash for application keys
+                                        let mut app_transcript = Sha256::new();
+                                        app_transcript.update(&client_handshake_bytes);
+                                        app_transcript.update(&raw_server_hello_bytes);
+                                        app_transcript.update(content);
+                                        let app_transcript_hash = app_transcript.finalize();
+
+                                        let client_app_traffic_secret =
+                                            HandshakeKeys::derive_secret(
+                                                &master_secret,
+                                                b"c ap traffic",
+                                                &app_transcript_hash,
+                                                32,
+                                            );
+                                        let server_app_traffic_secret =
+                                            HandshakeKeys::derive_secret(
+                                                &master_secret,
+                                                b"s ap traffic",
+                                                &app_transcript_hash,
+                                                32,
+                                            );
+                                        let client_app_key = HandshakeKeys::derive_secret(
+                                            &client_app_traffic_secret,
+                                            b"key",
+                                            &[],
+                                            32,
+                                        );
+                                        let client_app_iv = HandshakeKeys::derive_secret(
+                                            &client_app_traffic_secret,
+                                            b"iv",
+                                            &[],
+                                            12,
+                                        );
+                                        let server_app_key = HandshakeKeys::derive_secret(
+                                            &server_app_traffic_secret,
+                                            b"key",
+                                            &[],
+                                            32,
+                                        );
+                                        let server_app_iv = HandshakeKeys::derive_secret(
+                                            &server_app_traffic_secret,
+                                            b"iv",
+                                            &[],
+                                            12,
+                                        );
+                                        info!("Application traffic keys derived");
+
+                                        // Send HTTP GET request encrypted with application keys
+                                        let http_request = b"GET /robots.txt HTTP/1.1\r\nHost: www.cloudflare.com\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n";
+                                        let mut app_plaintext = http_request.to_vec();
+                                        app_plaintext.push(0x17); // inner content type = ApplicationData
+
+                                        let mut app_nonce = [0u8; 12];
+                                        app_nonce.copy_from_slice(&client_app_iv);
+                                        // seq num is 0 for first app record, XOR with 0 is no-op
+
+                                        let app_ct_len = (app_plaintext.len() + 16) as u16;
+                                        let app_aad = vec![
+                                            0x17u8,
+                                            0x03,
+                                            0x03,
+                                            (app_ct_len >> 8) as u8,
+                                            app_ct_len as u8,
+                                        ];
+                                        let app_key = Key::from_slice(&client_app_key);
+                                        let app_cipher = ChaCha20Poly1305::new(app_key);
+                                        let app_nonce_obj = Nonce::from_slice(&app_nonce);
+                                        let app_ciphertext = app_cipher
+                                            .encrypt(
+                                                app_nonce_obj,
+                                                Payload {
+                                                    msg: &app_plaintext,
+                                                    aad: &app_aad,
+                                                },
+                                            )
+                                            .unwrap();
+
+                                        let app_record = TLSRecord {
+                                            record_type: ContentType::ApplicationData,
+                                            legacy_record_version: TLS_VERSION_COMPATIBILITY,
+                                            length: app_ciphertext.len() as u16,
+                                            fragment: app_ciphertext,
+                                        };
+                                        stream.write_all(&app_record.as_bytes().unwrap()).unwrap();
+                                        info!("HTTP GET request sent!");
+
+                                        // Read and decrypt server's response
+                                        let response_buffer =
+                                            process_tcp_stream(&mut stream).unwrap_or_default();
+                                        info!("Response received: {} bytes", response_buffer.len());
+                                        let response_records =
+                                            tls13tutorial::get_records(response_buffer)
+                                                .unwrap_or_default();
+                                        let mut server_app_seq: u64 = 0;
+                                        for resp_record in response_records {
+                                            if let ContentType::ApplicationData =
+                                                resp_record.record_type
+                                            {
+                                                let mut resp_nonce = [0u8; 12];
+                                                resp_nonce.copy_from_slice(&server_app_iv);
+                                                let seq_b = server_app_seq.to_be_bytes();
+                                                for i in 0..8 {
+                                                    resp_nonce[4 + i] ^= seq_b[i];
+                                                }
+                                                server_app_seq += 1;
+                                                let resp_len = resp_record.length.to_be_bytes();
+                                                let resp_aad = vec![
+                                                    0x17u8,
+                                                    0x03,
+                                                    0x03,
+                                                    resp_len[0],
+                                                    resp_len[1],
+                                                ];
+                                                let resp_key = Key::from_slice(&server_app_key);
+                                                let resp_cipher = ChaCha20Poly1305::new(resp_key);
+                                                let resp_nonce_obj = Nonce::from_slice(&resp_nonce);
+                                                match resp_cipher.decrypt(
+                                                    resp_nonce_obj,
+                                                    Payload {
+                                                        msg: &resp_record.fragment,
+                                                        aad: &resp_aad,
+                                                    },
+                                                ) {
+                                                    Ok(plaintext) => {
+                                                        // Strip trailing content type byte
+                                                        if let Some(pos) =
+                                                            plaintext.iter().rposition(|&b| b != 0)
+                                                        {
+                                                            let content = &plaintext[..pos];
+                                                            info!(
+                                                                "Decrypted response ({} bytes):",
+                                                                content.len()
+                                                            );
+                                                            println!(
+                                                                "{}",
+                                                                String::from_utf8_lossy(content)
+                                                            );
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        error!("Response decryption failed: {e}");
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                     21 => {
                                         info!("Encrypted alert received: {:?}", content);
