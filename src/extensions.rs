@@ -47,34 +47,38 @@ impl Extension {
         let ext_type = bytes.get_u16().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid extension type")
         })?;
-        debug!("ExtensionType: {:?}", ext_type);
-
         let ext_data_len = bytes.get_u16().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Invalid extension data length",
             )
         })?;
-        debug!("Extension data length: {}", ext_data_len);
         let ext_data = bytes.get_bytes(ext_data_len as usize);
         let mut ext_bytes = ByteParser::from(ext_data);
-        debug!("Extension data: {:?}", ext_bytes);
-        // let extension_data = match ext_type {
-        // TODO Implement the rest of the extension types
-        //     0 => ExtensionData::ServerName(*ServerNameList::from_bytes(&mut ext_bytes)?),
-        //     _ => {
-        //         warn!("Unknown ExtensionType: {}", ext_type);
-        //         return Err(std::io::Error::new(
-        //             std::io::ErrorKind::InvalidData,
-        //             "Invalid extension data",
-        //         ));
-        //     }
-        // };
-        // Use placeholder `Unserialized` for now, not all extension data types are implemented
+
+        let extension_data = match (ext_type, origin) {
+            (51, ExtensionOrigin::Server) => {
+                let entry = KeyShareServerHello::from_bytes(&mut ext_bytes)?;
+                ExtensionData::KeyShareServerHello(*entry)
+            }
+            (43, ExtensionOrigin::Server) => {
+                let sv = SupportedVersions::from_bytes(&mut ext_bytes)?;
+                ExtensionData::SupportedVersions(*sv)
+            }
+            (43, ExtensionOrigin::Client) => {
+                let sv = SupportedVersions::from_bytes(&mut ext_bytes)?;
+                ExtensionData::SupportedVersions(*sv)
+            }
+            _ => {
+                warn!("Unseralized extension type: {}", ext_type);
+                ExtensionData::Unserialized(ext_bytes.drain())
+            }
+        };
+
         Ok(Box::new(Extension {
             origin,
             extension_type: ext_type.into(),
-            extension_data: ExtensionData::Unserialized(ext_bytes.drain()),
+            extension_data,
         }))
     }
 }
@@ -221,9 +225,25 @@ impl ByteSerializable for SupportedVersions {
         // It takes at least 3 bytes to present ClientHello
         // Not the best for validation, but it's a start
         if bytes.len() > 2 {
-            todo!("We don't support receiving ClientHello")
+            let list_len = bytes.get_u8().ok_or_else(ByteParser::insufficient_data)? as usize;
+            if bytes.len() < list_len {
+                return Err(ByteParser::insufficient_data());
+            }
+            let mut versions = Vec::new();
+            let mut remaining = list_len;
+            while remaining >= 2 {
+                let v = bytes.get_u16().ok_or_else(ByteParser::insufficient_data)?;
+                versions.push(v);
+                remaining -= 2;
+            }
+            Ok(Box::new(SupportedVersions {
+                version: VersionKind::Suggested(versions),
+            }))
         } else {
-            todo!("Serialize Selected variant")
+            let version = bytes.get_u16().ok_or_else(ByteParser::insufficient_data)?;
+            Ok(Box::new(SupportedVersions {
+                version: VersionKind::Suggested(vec![version]),
+            }))
         }
     }
 }
@@ -295,8 +315,37 @@ impl ByteSerializable for ServerNameList {
         Some(bytes)
     }
 
-    fn from_bytes(_bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
-        todo!("Implement ServerNameList from_bytes")
+    fn from_bytes(bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
+        let list_len = bytes.get_u16().ok_or_else(ByteParser::insufficient_data)? as usize;
+        if bytes.len() < list_len {
+            return Err(ByteParser::insufficient_data());
+        }
+        let list_bytes = bytes.get_bytes(list_len);
+        let mut list_parser = ByteParser::from(list_bytes);
+        let mut server_name_list = Vec::new();
+        while !list_parser.is_empty() {
+            let name_type = match list_parser
+                .get_u8()
+                .ok_or_else(ByteParser::insufficient_data)?
+            {
+                0 => NameType::HostName,
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid NameType",
+                    ))
+                }
+            };
+            let name_len = list_parser
+                .get_u16()
+                .ok_or_else(ByteParser::insufficient_data)? as usize;
+            let host_name = list_parser.get_bytes(name_len);
+            server_name_list.push(ServerName {
+                name_type,
+                host_name,
+            });
+        }
+        Ok(Box::new(ServerNameList { server_name_list }))
     }
 }
 
@@ -466,8 +515,17 @@ impl ByteSerializable for KeyShareEntry {
         Some(bytes)
     }
 
-    fn from_bytes(_bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
-        todo!("Implement KeyShareEntry from_bytes")
+    fn from_bytes(bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
+        let group = *NamedGroup::from_bytes(bytes)?;
+        let key_len = bytes.get_u16().ok_or_else(ByteParser::insufficient_data)? as usize;
+        if bytes.len() < key_len {
+            return Err(ByteParser::insufficient_data());
+        }
+        let key_exchange = bytes.get_bytes(key_len);
+        Ok(Box::new(KeyShareEntry {
+            group,
+            key_exchange,
+        }))
     }
 }
 
